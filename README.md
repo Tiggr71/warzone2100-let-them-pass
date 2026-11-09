@@ -26,3 +26,7 @@ Look for `Friendly traffic:` entries in the portable profile's `logs` directory 
 The complete ZIP includes a `source` folder. On GitHub, the Windows player ZIP and its corresponding source ZIP are separate downloads. The source folder includes the modified engine and its submodules, a patch against the original 4.7.0 tag, build instructions, and the source archives for the bundled runtime libraries. See `COPYING`, `COPYING.README`, `COPYING.NONGPL`, and `licenses` for the applicable notices. This modified build carries forward the Warzone 2100 linking exception in `COPYING.README`.
 
 Upstream game and documentation are available from [the Warzone 2100 project](https://github.com/Warzone2100/warzone2100).
+
+## Credits
+
+OpenAI Codex (June) implemented and documented the Let Them Pass engine changes. Tiggr71 identified the movement problems, proposed the staggered retry, supplied saves that reproduced the stalls, and tested the changes in live gameplay. Warzone 2100 itself is the work of the original developers and the upstream project contributors.
