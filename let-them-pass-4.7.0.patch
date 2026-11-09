@@ -1,0 +1,580 @@
+diff --git a/lib/exceptionhandler/3rdparty/StackWalker.h b/lib/exceptionhandler/3rdparty/StackWalker.h
+index f6c56f0..94a9b3f 100644
+--- a/lib/exceptionhandler/3rdparty/StackWalker.h
++++ b/lib/exceptionhandler/3rdparty/StackWalker.h
+@@ -4,7 +4,7 @@
+ #ifndef __STACKWALKER_H__
+ #define __STACKWALKER_H__
+ 
+-#if defined(_MSC_VER) || ((defined(__MINGW32__) || defined(__MINGW64__)) && defined(__clang__))
++#if defined(_MSC_VER) || defined(__MINGW32__) || defined(__MINGW64__)
+ 
+ /**********************************************************************
+  *
+diff --git a/lib/exceptionhandler/exchndl_win.cpp b/lib/exceptionhandler/exchndl_win.cpp
+index 0ab7276..9f5d677 100644
+--- a/lib/exceptionhandler/exchndl_win.cpp
++++ b/lib/exceptionhandler/exchndl_win.cpp
+@@ -38,6 +38,7 @@
+ #include <shlobj.h>
+ #include <shlwapi.h>
+ 
++#include <limits>
+ #include <vector>
+ 
+ // Declare the static variables
+diff --git a/lib/netplay/ip_helpers.cpp b/lib/netplay/ip_helpers.cpp
+index 3b0cf15..e9a9996 100644
+--- a/lib/netplay/ip_helpers.cpp
++++ b/lib/netplay/ip_helpers.cpp
+@@ -34,6 +34,7 @@
+ #endif
+ 
+ # include <cstring> // std::memcpy
++# include <cstdint>
+ 
+ const char* to_string(IPFormat ipFormat)
+ {
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 4f07f0e..36ca4c2 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -223,13 +223,6 @@ if(CMAKE_SYSTEM_NAME MATCHES "Windows")
+     target_link_libraries(warzone2100 ws2_32 iphlpapi shlwapi ole32 psapi)
+ endif()
+ 
+-if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+-  if(CMAKE_SYSTEM_NAME MATCHES "Windows")
+-    set_target_properties(warzone2100 PROPERTIES LINK_FLAGS "-Wl,--start-group,-subsystem,windows")
+-    set_target_properties(warzone2100 PROPERTIES LINK_FLAGS "-Wl,--end-group")
+-  endif()
+-endif()
+-
+ add_subdirectory(integrations)
+ 
+ if(ENABLE_DISCORD)
+diff --git a/src/move.cpp b/src/move.cpp
+index 93f4d9b..29267aa 100644
+--- a/src/move.cpp
++++ b/src/move.cpp
+@@ -60,6 +60,8 @@
+ #include "steering/steering.h"
+ #include "steering/collision_avoidance_behavior.h"
+ 
++#include <optional>
++
+ /* max and min vtol heights above terrain */
+ #define	VTOL_HEIGHT_MIN				250
+ #define	VTOL_HEIGHT_LEVEL			300
+@@ -82,6 +84,26 @@
+ // How far a droid has to rotate before it is no longer 'stationary'
+ #define BLOCK_DIR		90
+ 
++static constexpr unsigned TRAFFIC_STALL_TIME = 3 * GAME_TICKS_PER_SEC;
++static constexpr unsigned TRAFFIC_CHECK_INTERVAL = GAME_TICKS_PER_SEC / 2;
++static constexpr unsigned TRAFFIC_MAX_HOLD = 30 * GAME_TICKS_PER_SEC;
++static constexpr unsigned TRAFFIC_PRIORITY_MEMORY = 45 * GAME_TICKS_PER_SEC;
++static constexpr int TRAFFIC_RADIUS = 12 * TILE_UNITS;
++
++struct FriendlyTrafficConflict
++{
++	Vector2i center;
++	uint16_t priorityDirection;
++	unsigned id;
++	unsigned startTime;
++	unsigned nextCheck;
++	unsigned endTime = 0;
++};
++
++static std::vector<FriendlyTrafficConflict> friendlyTrafficConflicts;
++static unsigned friendlyTrafficConflictId = 0;
++static unsigned friendlyTrafficUpdateTime = 0;
++
+ // How far out from an obstruction to start avoiding it
+ #define AVOID_DIST		(TILE_UNITS*2)
+ 
+@@ -118,6 +140,9 @@ static steering::SteeringManager& moveSteeringManager()
+ 
+ void moveInit()
+ {
++	friendlyTrafficConflicts.clear();
++	friendlyTrafficConflictId = 0;
++	friendlyTrafficUpdateTime = 0;
+ 	// Initialize formation speed limiting to off for all players
+ 	playerFormationSpeedLimiting.resize(MAX_PLAYERS);
+ 	for (size_t i = 0; i < playerFormationSpeedLimiting.size(); ++i)
+@@ -1185,8 +1210,367 @@ static void moveCalcBlockingSlide(DROID *psDroid, int32_t *pmx, int32_t *pmy, ui
+ }
+ 
+ 
+-// see if a droid has run into another droid
+-// Only consider stationery droids
++static bool canYieldInTraffic(const DROID *droid)
++{
++	return !bMultiPlayer && droid->player == selectedPlayer && !droid->died
++	       && droid->order.type == DORDER_MOVE && droid->action == DACTION_MOVE
++	       && (droid->sMove.Status == MOVEPOINTTOPOINT || droid->sMove.Status == MOVEPAUSE)
++	       && droid->getPropulsionStats()->propulsionType != PROPULSION_TYPE_LIFT
++	       && !droid->isTransporter();
++}
++
++static void moveRecoverOrphanedPause(DROID *droid, bool yielding)
++{
++	auto &move = droid->sMove;
++	auto &traffic = move.friendlyTraffic;
++	const Vector2i position = droid->pos.xy();
++	if (traffic.wakeAttempts != 0 && iHypot(position - traffic.wakePosition) >= TILE_UNITS / 2)
++	{
++		traffic.wakeAttempts = 0;
++	}
++	if (yielding || move.Status != MOVEPAUSE || move.bumpTime != 0 || !canYieldInTraffic(droid))
++	{
++		traffic.wakeDelay = 0;
++		return;
++	}
++
++	// A normal pause is released by the bump timer. With no bump, it needs its own retry.
++	if (traffic.wakeDelay == 0)
++	{
++		const unsigned maxDelay = std::min(800u << traffic.wakeAttempts, 2000u);
++		uint32_t seed = droid->id * 0x9e3779b9u ^ gameTime;
++		seed ^= seed >> 16;
++		seed *= 0x7feb352du;
++		seed ^= seed >> 15;
++		traffic.wakeStart = gameTime;
++		traffic.wakeDelay = 200u + seed % (maxDelay - 200u + 1u);
++		traffic.wakePosition = position;
++	}
++	if (gameTime - traffic.wakeStart >= traffic.wakeDelay)
++	{
++		debug(LOG_INFO, "Friendly traffic: droid %u resumed a paused move after %u ms without a bump timer",
++		      droid->id, gameTime - traffic.wakeStart);
++		traffic.wakeDelay = 0;
++		traffic.wakeAttempts = std::min(traffic.wakeAttempts + 1, 2u);
++		move.Status = MOVEPOINTTOPOINT;
++	}
++}
++
++static Vector2i trafficHeading(const DROID *droid)
++{
++	const auto &move = droid->sMove;
++	const Vector2i position = droid->pos.xy();
++	for (size_t i = std::max(0, move.pathIndex - 1); i < move.asPath.size(); ++i)
++	{
++		const Vector2i heading = move.asPath[i] - position;
++		if (iHypot(heading) >= 5 * TILE_UNITS)
++		{
++			return heading;
++		}
++	}
++	return move.destination - position;
++}
++
++static int trafficDistanceToExit(const DROID *droid, const Vector2i &center)
++{
++	const auto &move = droid->sMove;
++	for (size_t i = std::max(0, move.pathIndex - 1); i < move.asPath.size(); ++i)
++	{
++		if (iHypot(move.asPath[i] - center) >= 2 * TILE_UNITS)
++		{
++			return iHypot(move.asPath[i] - droid->pos.xy());
++		}
++	}
++	return iHypot(move.destination - droid->pos.xy());
++}
++
++static void noticeFriendlyTraffic(const DROID *droid, const DROID *other)
++{
++	if (!canYieldInTraffic(droid) || !canYieldInTraffic(other)
++	    || droid->sMove.friendlyTraffic.progressTime == 0
++	    || other->sMove.friendlyTraffic.progressTime == 0
++	    || gameTime - droid->sMove.friendlyTraffic.progressTime < TRAFFIC_STALL_TIME
++	    || gameTime - other->sMove.friendlyTraffic.progressTime < TRAFFIC_STALL_TIME
++	    || dot(trafficHeading(droid), trafficHeading(other)) >= 0)
++	{
++		return;
++	}
++
++	const Vector2i center = (droid->pos.xy() + other->pos.xy()) / 2;
++	const FriendlyTrafficConflict *previous = nullptr;
++	for (const auto &conflict : friendlyTrafficConflicts)
++	{
++		const int separation = iHypot(conflict.center - center);
++		if (separation <= TRAFFIC_RADIUS && conflict.endTime == 0)
++		{
++			return;
++		}
++		if (separation <= 5 * TILE_UNITS && conflict.endTime != 0 && (!previous || conflict.endTime > previous->endTime))
++		{
++			previous = &conflict;
++		}
++	}
++	const int distance = trafficDistanceToExit(droid, center);
++	const int otherDistance = trafficDistanceToExit(other, center);
++	const DROID *priority = (distance < otherDistance || (distance == otherDistance && droid->id < other->id)) ? droid : other;
++	if (previous && abs(angleDelta(iAtan2(trafficHeading(priority)) - previous->priorityDirection)) <= DEG(90))
++	{
++		// A recurring conflict gives the previous yielding line the next turn.
++		priority = priority == droid ? other : droid;
++	}
++	friendlyTrafficConflicts.push_back({center, static_cast<uint16_t>(iAtan2(trafficHeading(priority))), ++friendlyTrafficConflictId,
++	                                   gameTime, gameTime + 2 * TRAFFIC_STALL_TIME});
++	debug(LOG_INFO, "Friendly traffic: droids %u and %u stalled at (%d,%d); droid %u has right of way",
++	      droid->id, other->id, map_coord(center.x), map_coord(center.y), priority->id);
++}
++
++static bool trafficHeadsAgainst(const DROID *droid, const FriendlyTrafficConflict &conflict)
++{
++	return abs(angleDelta(iAtan2(trafficHeading(droid)) - conflict.priorityDirection)) > DEG(90);
++}
++
++static void updateFriendlyTrafficConflicts()
++{
++	if (friendlyTrafficUpdateTime == gameTime)
++	{
++		return;
++	}
++	friendlyTrafficUpdateTime = gameTime;
++	friendlyTrafficConflicts.erase(std::remove_if(friendlyTrafficConflicts.begin(), friendlyTrafficConflicts.end(),
++		[](FriendlyTrafficConflict &conflict) {
++			if (gameTime < conflict.startTime)
++			{
++				return true;
++			}
++			if (conflict.endTime != 0)
++			{
++				return gameTime - conflict.endTime >= TRAFFIC_PRIORITY_MEMORY;
++			}
++			if (gameTime - conflict.startTime >= TRAFFIC_MAX_HOLD)
++			{
++				conflict.endTime = gameTime;
++				return false;
++			}
++			if (gameTime < conflict.nextCheck)
++			{
++				return false;
++			}
++			conflict.nextCheck = gameTime + TRAFFIC_CHECK_INTERVAL;
++			for (BASE_OBJECT *object : gridStartIterate(conflict.center.x, conflict.center.y, 5 * TILE_UNITS))
++			{
++				const DROID *droid = castDroid(object);
++				if (droid && canYieldInTraffic(droid) && !trafficHeadsAgainst(droid, conflict))
++				{
++					return false;
++				}
++			}
++			conflict.endTime = gameTime;
++			return false;
++		}), friendlyTrafficConflicts.end());
++}
++
++static bool trafficUsesPassage(const DROID *droid, const Vector2i &center)
++{
++	constexpr int passageRadius = 4 * TILE_UNITS;
++	const auto &move = droid->sMove;
++	if (iHypot(droid->pos.xy() - center) <= passageRadius)
++	{
++		return true;
++	}
++	const auto start = std::min<size_t>(std::max(0, move.pathIndex - 1), move.asPath.size());
++	const auto end = std::min(start + 2 * TRAFFIC_RADIUS / TILE_UNITS, move.asPath.size());
++	return std::any_of(move.asPath.begin() + start, move.asPath.begin() + end,
++	                   [&center](const Vector2i &waypoint) { return iHypot(waypoint - center) <= passageRadius; });
++}
++
++static bool trafficLineClear(DROID *droid, const Vector2i &target, const GridList &nearby)
++{
++	const Vector2i start = droid->pos.xy();
++	const auto propulsion = droid->getPropulsionStats()->propulsionType;
++	if (target == start || !worldOnMap(target.x, target.y) || fpathBlockingTile(map_coord(target.x), map_coord(target.y), propulsion))
++	{
++		return false;
++	}
++
++	BLOCKING_CALLBACK_DATA data;
++	data.propulsionType = propulsion;
++	data.blocking = false;
++	data.src = start;
++	data.dst = target;
++	rayCast(start, target, &moveBlockingTileCallback, &data);
++	if (data.blocking)
++	{
++		return false;
++	}
++
++	const Vector2i line = target - start;
++	const int64_t lengthSq = dot(line, line);
++	for (BASE_OBJECT *object : nearby)
++	{
++		const DROID *other = castDroid(object);
++		if (!other || other == droid || other->died || other->isFlying())
++		{
++			continue;
++		}
++		const Vector2i offset = other->pos.xy() - start;
++		const int64_t projection = dot(offset, line);
++		const int64_t clearance = moveObjRadius(droid) + moveObjRadius(other);
++		if (projection <= 0)
++		{
++			continue; // Allow movement away from a droid we already touch.
++		}
++		if (projection >= lengthSq)
++		{
++			if (iHypot(other->pos.xy() - target) < clearance)
++			{
++				return false;
++			}
++			continue;
++		}
++		const int64_t cross = int64_t(line.x) * offset.y - int64_t(line.y) * offset.x;
++		if (cross * cross < clearance * clearance * lengthSq)
++		{
++			return false;
++		}
++	}
++	return true;
++}
++
++static std::optional<Vector2i> findFriendlyTrafficTarget(DROID *droid, const FriendlyTrafficConflict &conflict, bool &detour)
++{
++	const Vector2i start = droid->pos.xy();
++	const GridList nearby = gridStartIterate(start.x, start.y, 5 * TILE_UNITS);
++	const auto direction = uint16_t(conflict.priorityDirection + DEG(180));
++	const Vector2i forward = iSinCosR(direction, 2 * TILE_UNITS);
++	const Vector2i side = iSinCosR(direction + DEG(90), TILE_UNITS);
++
++	// A clear short bypass costs less than backing a line of droids out.
++	for (const int lane : {1, -1, 2, -2})
++	{
++		const Vector2i target = start + forward + side * lane;
++		if (dot(start - conflict.center, forward) < 0 && dot(target - conflict.center, forward) >= TILE_UNITS * TILE_UNITS
++		    && trafficLineClear(droid, target, nearby))
++		{
++			detour = true;
++			return target;
++		}
++	}
++
++	// At an opening, make room next to the lane and let the other line pass.
++	for (const int lane : {1, -1, 2, -2})
++	{
++		const Vector2i target = start - forward / 4 + side * lane;
++		if (abs(dot(target - conflict.center, side)) >= 2 * TILE_UNITS * TILE_UNITS
++		    && abs(dot(target - conflict.center, side)) > abs(dot(start - conflict.center, side))
++		    && trafficLineClear(droid, target, nearby))
++		{
++			return target;
++		}
++	}
++
++	// Walk back along the original route when that stretch is still clear.
++	const auto &move = droid->sMove;
++	for (int i = std::min(move.pathIndex - 1, static_cast<int>(move.asPath.size()) - 1); i >= 0; --i)
++	{
++		const Vector2i target = move.asPath[i];
++		const Vector2i delta = target - start;
++		const int distance = iHypot(delta);
++		if (distance > 3 * TILE_UNITS)
++		{
++			break;
++		}
++		if (distance >= TILE_UNITS / 2 && dot(delta, forward) < 0 && trafficLineClear(droid, target, nearby))
++		{
++			return target;
++		}
++	}
++
++	// A route may have been recalculated from the jam itself. Try a short retreat or pullout.
++	for (const int lane : {0, 1, -1})
++	{
++		const Vector2i target = start - forward / 2 + side * lane;
++		if (trafficLineClear(droid, target, nearby))
++		{
++			return target;
++		}
++	}
++	return std::nullopt;
++}
++
++static std::optional<Vector2i> friendlyTrafficSteering(DROID *droid)
++{
++	if (!canYieldInTraffic(droid))
++	{
++		return std::nullopt;
++	}
++	auto &state = droid->sMove.friendlyTraffic;
++	const Vector2i pos = droid->pos.xy();
++	if (state.progressTime == 0 || iHypot(pos - state.progressPosition) >= TILE_UNITS / 2)
++	{
++		state.progressPosition = pos;
++		state.progressTime = gameTime;
++	}
++	updateFriendlyTrafficConflicts();
++	for (const auto &conflict : friendlyTrafficConflicts)
++	{
++		if (conflict.endTime != 0 || state.orderTime >= conflict.startTime)
++		{
++			continue;
++		}
++		if (state.maneuver != conflict.id)
++		{
++			if (iHypot(pos - conflict.center) > TRAFFIC_RADIUS || !trafficHeadsAgainst(droid, conflict)
++			    || !trafficUsesPassage(droid, conflict.center))
++			{
++				continue;
++			}
++			state.maneuver = conflict.id;
++			state.nextAttempt = 0;
++			state.target = {-1, -1};
++			state.detour = false;
++			state.detourComplete = false;
++		}
++		if (state.detourComplete)
++		{
++			return std::nullopt;
++		}
++		if (state.target.x >= 0 && iHypot(state.target - pos) <= TILE_UNITS / 4)
++		{
++			state.detourComplete = state.detour;
++			if (state.detourComplete)
++			{
++				if (!droid->sMove.asPath.empty())
++				{
++					moveBestTarget(droid);
++				}
++				return std::nullopt;
++			}
++			// A unit along the lane must keep retreating. Stop in a shoulder or beyond the queue.
++			const Vector2i side = iSinCosR(conflict.priorityDirection + DEG(90), TILE_UNITS);
++			if (abs(dot(pos - conflict.center, side)) >= 2 * TILE_UNITS * TILE_UNITS
++			    || iHypot(pos - conflict.center) >= TRAFFIC_RADIUS)
++			{
++				return pos;
++			}
++			state.target = {-1, -1};
++		}
++		if (gameTime >= state.nextAttempt)
++		{
++			state.nextAttempt = gameTime + TRAFFIC_CHECK_INTERVAL;
++			if (state.target.x < 0 || gameTime - state.progressTime >= TRAFFIC_STALL_TIME)
++			{
++				state.detour = false;
++				state.target = findFriendlyTrafficTarget(droid, conflict, state.detour).value_or(Vector2i(-1, -1));
++				state.progressPosition = pos;
++				state.progressTime = gameTime;
++			}
++		}
++		return state.target.x < 0 ? pos : state.target;
++	}
++	return std::nullopt;
++}
++
++// See if a droid has run into another droid.
+ static void moveCalcDroidSlide(DROID *psDroid, int *pmx, int *pmy)
+ {
+ 	int32_t		droidR, rad, radSq, objR, xdiff, ydiff, distSq, spmx, spmy;
+@@ -1263,6 +1647,8 @@ static void moveCalcDroidSlide(DROID *psDroid, int *pmx, int *pmy)
+ 
+ 		if (radSq > distSq)
+ 		{
++			// Leave the real route and collision physics in place. Only steering can yield.
++			noticeFriendlyTraffic(psDroid, static_cast<const DROID *>(psObj));
+ 			if (psObst != nullptr)
+ 			{
+ 				// hit more than one droid - stop
+@@ -2188,7 +2574,20 @@ void moveUpdateDroid(DROID *psDroid)
+ 	moveSpeed = 0;
+ 	moveDir = psDroid->rot.direction;
+ 
+-	switch (psDroid->sMove.Status)
++	const auto trafficTarget = friendlyTrafficSteering(psDroid);
++	moveRecoverOrphanedPause(psDroid, trafficTarget.has_value());
++	const auto originalTarget = psDroid->sMove.target;
++	if (trafficTarget)
++	{
++		psDroid->sMove.Status = MOVEPOINTTOPOINT;
++		psDroid->sMove.target = *trafficTarget;
++		if (*trafficTarget != psDroid->pos.xy())
++		{
++			moveDir = iAtan2(*trafficTarget - psDroid->pos.xy());
++			moveSpeed = moveCalcDroidSpeed(psDroid) * 2 / 3;
++		}
++	}
++	else switch (psDroid->sMove.Status)
+ 	{
+ 	case MOVEINACTIVE:
+ 		if (psDroid->animationEvent == ANIM_EVENT_ACTIVE)
+@@ -2407,6 +2806,12 @@ void moveUpdateDroid(DROID *psDroid)
+ 		moveUpdateGroundModel(psDroid, moveSpeed, moveDir);
+ 	}
+ 
++	if (trafficTarget)
++	{
++		psDroid->sMove.Status = static_cast<MOVE_STATUS>(oldStatus);
++		psDroid->sMove.target = originalTarget;
++	}
++
+ 	if (map_coord(oldx) != map_coord(psDroid->pos.x)
+ 	    || map_coord(oldy) != map_coord(psDroid->pos.y))
+ 	{
+@@ -2419,7 +2824,7 @@ void moveUpdateDroid(DROID *psDroid)
+ 	}
+ 
+ 	// See if it's got blocked
+-	if ((psPropStats->propulsionType != PROPULSION_TYPE_LIFT) && moveBlocked(psDroid))
++	if (!trafficTarget && (psPropStats->propulsionType != PROPULSION_TYPE_LIFT) && moveBlocked(psDroid))
+ 	{
+ 		objTrace(psDroid->id, "status: id %d blocked", (int)psDroid->id);
+ 		psDroid->sMove.Status = MOVETURN;
+diff --git a/src/movedef.h b/src/movedef.h
+index ec92041..d029a62 100644
+--- a/src/movedef.h
++++ b/src/movedef.h
+@@ -42,6 +42,22 @@ enum MOVE_STATUS
+ 	MOVESHUFFLE,
+ };
+ 
++struct FriendlyTrafficState
++{
++	Vector2i progressPosition = {0, 0};
++	unsigned progressTime = 0;
++	unsigned orderTime = 0;
++	unsigned maneuver = 0;
++	unsigned nextAttempt = 0;
++	Vector2i target = {-1, -1};
++	bool detour = false;
++	bool detourComplete = false;
++	Vector2i wakePosition = {0, 0};
++	unsigned wakeStart = 0;
++	unsigned wakeDelay = 0;
++	unsigned wakeAttempts = 0;
++};
++
+ struct MOVE_CONTROL
+ {
+ 	MOVE_STATUS Status = MOVEINACTIVE;    ///< Inactive, Navigating or moving point to point status
+@@ -65,6 +81,9 @@ struct MOVE_CONTROL
+ 	FORMATION *psFormation = nullptr;     ///< formation the droid is currently a member of
+ 
+ 	int iVertSpeed = 0;                   ///< VTOL movement
++
++	// Transient steering only. Saves keep the original order and movement route.
++	FriendlyTrafficState friendlyTraffic;
+ };
+ 
+ #endif // __INCLUDED_MOVEDEF_H__
+diff --git a/src/order.cpp b/src/order.cpp
+index 0a5fc32..2c80283 100644
+--- a/src/order.cpp
++++ b/src/order.cpp
+@@ -1411,6 +1411,10 @@ void orderDroidBase(DROID *psDroid, DROID_ORDER_DATA *psOrder)
+ 		return;
+ 	}
+ 
++	// A new primary order supersedes any temporary traffic maneuver.
++	psDroid->sMove.friendlyTraffic = {};
++	psDroid->sMove.friendlyTraffic.orderTime = gameTime;
++
+ 	// deal with a droid receiving a primary order
+ 	if (!psDroid->isTransporter() && psOrder->type != DORDER_NONE && psOrder->type != DORDER_STOP && psOrder->type != DORDER_GUARD)
+ 	{
